@@ -4,3 +4,4 @@ plugins/
 config/
 __pycache__/
 .env.local
+.env
