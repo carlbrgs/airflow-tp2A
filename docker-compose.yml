@@ -12,6 +12,8 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    # Connexion utilisée par PostgresHook dans le DAG
+    AIRFLOW_CONN_POSTGRES_WEATHER: 'postgresql://airflow:airflow@postgres:5432/airflow'
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime
 
 import requests
 from airflow.decorators import dag, task
+from airflow.models.param import Param
+from airflow.operators.python import get_current_context
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-API_BASE_URL = "https://api.open-meteo.com/v1/forecast"
-OUTPUT_FILE = "/opt/airflow/data/weather_report.jsonl"
+API_BASE_URL    = "https://api.open-meteo.com/v1/forecast"
+POSTGRES_CONN_ID = "postgres_weather"
 
 CITIES = [
     {"name": "Paris",    "country": "FR", "latitude": 48.8566, "longitude":   2.3522},
@@ -24,7 +26,6 @@ CURRENT_VARIABLES = [
     "weather_code",
 ]
 
-# WMO weather interpretation codes (subset)
 WMO_CODES: dict[int, str] = {
     0: "Ciel dégagé",
     1: "Principalement dégagé", 2: "Partiellement nuageux", 3: "Couvert",
@@ -38,30 +39,75 @@ WMO_CODES: dict[int, str] = {
 
 
 @dag(
-    dag_id="weather_ingestion_dag",
-    description="Ingestion des données météo Open-Meteo pour Paris, New York et Tokyo",
+    dag_id="weather_pipeline_dag",
+    description="Pipeline complet Open-Meteo → transformation → PostgreSQL avec suivi d'ingestion",
     schedule=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=["tp2a", "meteo", "open-meteo"],
+    tags=["tp2b", "meteo", "open-meteo", "postgres"],
+    params={
+        "city_filter": Param(
+            default=[],
+            type="array",
+            description='Restreindre les villes interrogées. Vide = toutes. Ex: ["Paris", "Tokyo"]',
+        ),
+    },
 )
-def weather_ingestion_dag():
+def weather_pipeline_dag():
+
+    @task
+    def create_tables() -> None:
+        """Crée le schéma et les tables si inexistants (idempotent)."""
+        hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        hook.run([
+            "CREATE SCHEMA IF NOT EXISTS weather",
+            """
+            CREATE TABLE IF NOT EXISTS weather.current (
+                id                     SERIAL       PRIMARY KEY,
+                city                   VARCHAR(100) NOT NULL,
+                country                CHAR(2)      NOT NULL,
+                latitude               FLOAT        NOT NULL,
+                longitude              FLOAT        NOT NULL,
+                fetched_at             TIMESTAMP    NOT NULL,
+                temperature_c          FLOAT,
+                apparent_temperature_c FLOAT,
+                humidity_pct           INT,
+                precipitation_mm       FLOAT,
+                wind_speed_kmh         FLOAT,
+                weather_code           INT,
+                weather_description    VARCHAR(100)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS weather.ingestion_log (
+                id           SERIAL       PRIMARY KEY,
+                run_id       VARCHAR(200) NOT NULL,
+                dag_id       VARCHAR(200) NOT NULL,
+                ingested_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
+                city_count   INT          NOT NULL,
+                status       VARCHAR(50)  NOT NULL
+            )
+            """,
+        ])
 
     @task
     def fetch_weather() -> list[dict]:
         """Appelle l'API Open-Meteo pour chaque ville et retourne les réponses brutes."""
+        context     = get_current_context()
+        city_filter = context["params"].get("city_filter", [])
+        cities      = [c for c in CITIES if not city_filter or c["name"] in city_filter]
+
         results = []
-        for city in CITIES:
+        for city in cities:
             params = {
-                "latitude": city["latitude"],
+                "latitude":  city["latitude"],
                 "longitude": city["longitude"],
-                "current": ",".join(CURRENT_VARIABLES),
-                "timezone": "auto",
+                "current":   ",".join(CURRENT_VARIABLES),
+                "timezone":  "auto",
             }
             response = requests.get(API_BASE_URL, params=params, timeout=10)
             response.raise_for_status()
             raw = response.json()
-            # Attach city metadata alongside the raw API response
             raw["_city_meta"] = city
             results.append(raw)
         return results
@@ -70,11 +116,11 @@ def weather_ingestion_dag():
     def transform_weather(raw_responses: list[dict]) -> list[dict]:
         """Extrait les champs utiles et structure les données pour la table cible."""
         fetched_at = datetime.utcnow().isoformat()
-        records = []
+        records    = []
         for raw in raw_responses:
-            city = raw["_city_meta"]
+            city    = raw["_city_meta"]
             current = raw["current"]
-            code = int(current["weather_code"])
+            code    = int(current["weather_code"])
             records.append({
                 "city":                   city["name"],
                 "country":                city["country"],
@@ -92,20 +138,57 @@ def weather_ingestion_dag():
         return records
 
     @task
-    def load_weather(records: list[dict]) -> None:
-        """Sauvegarde les enregistrements transformés et affiche un aperçu."""
-        with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
-            for record in records:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    def load_to_postgres(records: list[dict]) -> int:
+        """Insère les enregistrements transformés dans weather.current."""
+        hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        rows = [
+            (
+                r["city"], r["country"], r["latitude"], r["longitude"],
+                r["fetched_at"], r["temperature_c"], r["apparent_temperature_c"],
+                r["humidity_pct"], r["precipitation_mm"], r["wind_speed_kmh"],
+                r["weather_code"], r["weather_description"],
+            )
+            for r in records
+        ]
+        hook.insert_rows(
+            table="weather.current",
+            rows=rows,
+            target_fields=[
+                "city", "country", "latitude", "longitude", "fetched_at",
+                "temperature_c", "apparent_temperature_c", "humidity_pct",
+                "precipitation_mm", "wind_speed_kmh", "weather_code", "weather_description",
+            ],
+        )
+        print(f"{len(rows)} ligne(s) insérée(s) dans weather.current")
+        return len(rows)
 
-        print(f"{len(records)} enregistrement(s) sauvegardés dans {OUTPUT_FILE}")
-        print("\n=== Aperçu des données préparées ===")
-        for record in records:
-            print(json.dumps(record, ensure_ascii=False, indent=2))
+    @task
+    def log_ingestion(city_count: int) -> None:
+        """Écrit une ligne de traçabilité dans weather.ingestion_log."""
+        context = get_current_context()
+        run_id  = context["run_id"]
+        dag_id  = context["dag"].dag_id
+        hook    = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        hook.run(
+            """
+            INSERT INTO weather.ingestion_log (run_id, dag_id, ingested_at, city_count, status)
+            VALUES (%s, %s, NOW(), %s, %s)
+            """,
+            parameters=(run_id, dag_id, city_count, "success"),
+        )
+        print(f"Ingestion loggée — run_id: {run_id}, villes chargées: {city_count}")
 
-    raw = fetch_weather()
-    transformed = transform_weather(raw)
-    load_weather(transformed)
+    # Graphe de dépendances :
+    #   create_tables ──────────────────────────┐
+    #                                            ▼
+    #   fetch_weather → transform_weather → load_to_postgres → log_ingestion
+    tables    = create_tables()
+    raw       = fetch_weather()
+    records   = transform_weather(raw)
+    row_count = load_to_postgres(records)
+    log_ingestion(row_count)
+
+    tables >> row_count  # garantit que les tables existent avant tout INSERT
 
 
-weather_ingestion_dag()
+weather_pipeline_dag()
